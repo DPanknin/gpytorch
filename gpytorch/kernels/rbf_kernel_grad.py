@@ -50,6 +50,16 @@ class RBFKernelGrad(RBFKernel):
         >>> covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernelGrad(batch_shape=torch.Size([2])))
         >>> covar = covar_module(x)  # Output: LinearOperator of size (2 x 60 x 60)
     """
+    
+    # TODO added by DANNY
+    def __init__(
+        self,
+        onlyDerivatives=False,
+        *args,
+        **kwargs,
+    ):
+        super(RBFKernelGrad, self).__init__(*args,**kwargs)
+        self.onlyDerivatives = onlyDerivatives
 
     def forward(self, x1, x2, diag=False, **params):
         batch_shape = x1.shape[:-2]
@@ -60,6 +70,10 @@ class RBFKernelGrad(RBFKernel):
         K = torch.zeros(*batch_shape, n1 * (d + 1), n2 * (d + 1), device=x1.device, dtype=x1.dtype)
 
         if not diag:
+            
+            if self.onlyDerivatives:
+                raise NotImplementedError
+            
             # Scale the inputs by the lengthscale (for stability)
             x1_ = x1.div(self.lengthscale)
             x2_ = x2.div(self.lengthscale)

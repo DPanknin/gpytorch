@@ -30,6 +30,7 @@ class InducingPointKernel(Kernel):
         inducing_points: Tensor,
         likelihood: Likelihood,
         active_dims: Optional[Tuple[int, ...]] = None,
+        cholJitter = None, # TODO added by DANNY
     ):
         super(InducingPointKernel, self).__init__(active_dims=active_dims)
         self.base_kernel = base_kernel
@@ -40,6 +41,8 @@ class InducingPointKernel(Kernel):
 
         self.register_parameter(name="inducing_points", parameter=torch.nn.Parameter(inducing_points))
         self.register_added_loss_term("inducing_point_loss_term")
+        
+        self.cholJitter = cholJitter # TODO added by DANNY
 
     def _clear_cache(self):
         if hasattr(self, "_cached_kernel_mat"):
@@ -62,7 +65,7 @@ class InducingPointKernel(Kernel):
         if not self.training and hasattr(self, "_cached_kernel_inv_root"):
             return self._cached_kernel_inv_root
         else:
-            chol = psd_safe_cholesky(self._inducing_mat, upper=True)
+            chol = psd_safe_cholesky(self._inducing_mat, upper=True, jitter = self.cholJitter, max_tries=100) # TODO added by DANNY
             eye = torch.eye(chol.size(-1), device=chol.device, dtype=chol.dtype)
             inv_root = torch.linalg.solve_triangular(chol, eye, upper=True)
 
@@ -144,8 +147,8 @@ class InducingPointKernel(Kernel):
 
         return cp
 
-    def prediction_strategy(self, train_inputs, train_prior_dist, train_labels, likelihood):
+    def prediction_strategy(self, train_inputs, train_prior_dist, train_labels, likelihood, jitter=None, cholJitter=None):
         # Allow for fast variances
         return exact_prediction_strategies.SGPRPredictionStrategy(
-            train_inputs, train_prior_dist, train_labels, likelihood
+            train_inputs, train_prior_dist, train_labels, likelihood, jitter=jitter, cholJitter=cholJitter # TODO added by DANNY
         )

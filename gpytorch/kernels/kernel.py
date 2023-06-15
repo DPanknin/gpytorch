@@ -435,15 +435,17 @@ class Kernel(Module):
         """
         return 1
 
-    def prediction_strategy(
+    def prediction_strategy( # TODO added by DANNY (jitter)
         self,
         train_inputs: Tensor,
         train_prior_dist: MultivariateNormal,
         train_labels: Tensor,
         likelihood: GaussianLikelihood,
+        jitter = None,
+        cholJitter = None,
     ) -> exact_prediction_strategies.PredictionStrategy:
         return exact_prediction_strategies.DefaultPredictionStrategy(
-            train_inputs, train_prior_dist, train_labels, likelihood
+            train_inputs, train_prior_dist, train_labels, likelihood, jitter=jitter, cholJitter=cholJitter # TODO added by DANNY (jitter)
         )
 
     def sub_kernels(self) -> Iterable[Kernel]:
