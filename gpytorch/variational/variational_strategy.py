@@ -25,7 +25,7 @@ from ..distributions import MultivariateNormal
 from ..models import ApproximateGP
 from ..settings import _linalg_dtype_cholesky, trace_mode
 from ..utils.errors import CachingError
-from ..utils.memoize import cached, clear_cache_hook, pop_from_cache_ignore_args
+from ..utils.memoize import cached, clear_cache_hook, pop_from_cache_ignore_args, _is_in_cache_ignore_args # TODO added by DANNY
 from ..utils.warnings import OldVersionWarning
 from . import _VariationalDistribution
 
@@ -100,8 +100,8 @@ class VariationalStrategy(_VariationalStrategy):
         self.has_fantasy_strategy = True
 
     @cached(name="cholesky_factor", ignore_args=True)
-    def _cholesky_factor(self, induc_induc_covar: LinearOperator) -> TriangularLinearOperator:
-        L = psd_safe_cholesky(to_dense(induc_induc_covar).type(_linalg_dtype_cholesky.value()))
+    def _cholesky_factor(self, induc_induc_covar: LinearOperator, jitter = None) -> TriangularLinearOperator: # TODO changed by DANNY
+        L = psd_safe_cholesky(to_dense(induc_induc_covar).type(_linalg_dtype_cholesky.value()), jitter = jitter, max_tries=100) # TODO changed by DANNY
         return TriangularLinearOperator(L)
 
     @property
@@ -185,35 +185,106 @@ class VariationalStrategy(_VariationalStrategy):
         variational_inducing_covar: Optional[LinearOperator] = None,
         **kwargs,
     ) -> MultivariateNormal:
+        
+        # TODO changed by DANNY
+        # try the following for reduced computational complexity, if we only require predictions
+        predictionsOnly = False
+        if 'predictionsOnly' in kwargs:
+            predictionsOnly = kwargs['predictionsOnly']
+            
+        jitter = None
+        if 'jitter' in kwargs:
+            jitter = kwargs['jitter']
+        cholJitter = None
+        if 'cholJitter' in kwargs:
+            cholJitter = kwargs['cholJitter']
+            
+        trainSize = inducing_points.shape[-2]
+        outputDim = self.model.covar_module.base_kernel.num_outputs_per_input(x, None)
+        # if we are in batch mode, adapt batch size accordingly
+        memoryThreshold = int(2**25)
+        batchThresholdSize = int(max(1, memoryThreshold // (trainSize * outputDim**2)))
+  
+        # idea: in predictionsOnly-mode, if the size of x exceeds a threshold (e.g. 1000), slice up x and call forward again on each slice. Then merge results
+        if not self.model.training and predictionsOnly and x.shape[-2] > batchThresholdSize:
+            predictive_mean = torch.empty(x.shape[:-1])
+            inx = 0
+            while inx < x.shape[-2]:
+                inxOld = inx
+                inx += batchThresholdSize
+                predictive_mean[..., inxOld:inx] = self.forward(x[..., inxOld:inx, :], inducing_points, inducing_values, variational_inducing_covar = variational_inducing_covar, **kwargs).mean
+            fakeCovar = DiagLinearOperator(torch.ones_like(predictive_mean))
+            return MultivariateNormal(predictive_mean, fakeCovar)
+            
         # Compute full prior distribution
-        full_inputs = torch.cat([inducing_points, x], dim=-2)
-        full_output = self.model.forward(full_inputs, **kwargs)
+        if predictionsOnly:
+            # distinguish, if we already have L or not
+            if not _is_in_cache_ignore_args(self, "cholesky_factor"):
+                full_inputs = torch.cat([inducing_points, x], dim=-2)
+            else:
+                # if we have L in predictions-only mode, we dont need induc_induc_covar part
+                full_inputs = x
+            full_output = self.model.forward(inducing_points, full_inputs, **kwargs)
+        else:
+            full_inputs = torch.cat([inducing_points, x], dim=-2)
+            full_output = self.model.forward(full_inputs, **kwargs)
         full_covar = full_output.lazy_covariance_matrix
-
+        
         # Covariance terms
         num_induc = inducing_points.size(-2)
-        test_mean = full_output.mean[..., num_induc:]
-        induc_induc_covar = full_covar[..., :num_induc, :num_induc].add_jitter(self.jitter_val)
-        induc_data_covar = full_covar[..., :num_induc, num_induc:].to_dense()
-        data_data_covar = full_covar[..., num_induc:, num_induc:]
+        num_data = x.size(-2)
+        num_total = full_inputs.size(-2)
+        num_induc_in_mean = num_total - num_data
 
-        # Compute interpolation terms
-        # K_ZZ^{-1/2} K_ZX
-        # K_ZZ^{-1/2} \mu_Z
-        L = self._cholesky_factor(induc_induc_covar)
-        if L.shape != induc_induc_covar.shape:
+        if not _is_in_cache_ignore_args(self, "cholesky_factor"):
+            if jitter is None:
+                induc_induc_covar = full_covar[..., :num_induc, :num_induc].add_jitter()
+            elif jitter > 0.:
+                induc_induc_covar = full_covar[..., :num_induc, :num_induc].add_jitter(jitter_val=jitter)
+            else:
+                induc_induc_covar = full_covar[..., :num_induc, :num_induc]
+            
+            # I added this for enforcing symmetry
+            induc_induc_covar = induc_induc_covar.to_dense()
+            induc_induc_covar = (induc_induc_covar + induc_induc_covar.transpose(-2,-1))/2
+        else:
+            induc_induc_covar = None
+        
+        L = self._cholesky_factor(induc_induc_covar, jitter = cholJitter)
+        
+        if L.shape != torch.Size([num_induc,num_induc]):
             # Aggressive caching can cause nasty shape incompatibilies when evaluating with different batch shapes
             # TODO: Use a hook fo this
             try:
                 pop_from_cache_ignore_args(self, "cholesky_factor")
             except CachingError:
                 pass
-            L = self._cholesky_factor(induc_induc_covar)
+            induc_induc_covar = self.model.forward(inducing_points, inducing_points, **kwargs).lazy_covariance_matrix
+            if jitter is None:
+                induc_induc_covar = induc_induc_covar.add_jitter()
+            elif jitter > 0.:
+                induc_induc_covar = induc_induc_covar.add_jitter(jitter_val=jitter)
+            L = self._cholesky_factor(induc_induc_covar, jitter = cholJitter)
+            
+        test_mean = full_output.mean[..., num_induc_in_mean:]
+        induc_data_covar = full_covar[..., :num_induc, num_induc_in_mean:].evaluate()
+        if not predictionsOnly:
+            data_data_covar = full_covar[..., num_induc:, num_induc_in_mean:]
+        
+        # Compute interpolation terms
+        # K_ZZ^{-1/2} K_ZX
+        # K_ZZ^{-1/2} \mu_Z
+        #interp_term = L.inv_matmul(induc_data_covar.type(_linalg_dtype_cholesky.value())).to(full_inputs.dtype)
         interp_term = L.solve(induc_data_covar.type(_linalg_dtype_cholesky.value())).to(full_inputs.dtype)
 
         # Compute the mean of q(f)
         # k_XZ K_ZZ^{-1/2} (m - K_ZZ^{-1/2} \mu_Z) + \mu_X
         predictive_mean = (interp_term.transpose(-1, -2) @ inducing_values.unsqueeze(-1)).squeeze(-1) + test_mean
+        
+        if predictionsOnly:
+            #return predictive_mean
+            fakeCovar = DiagLinearOperator(torch.ones_like(predictive_mean))
+            return MultivariateNormal(predictive_mean, fakeCovar)
 
         # Compute the covariance of q(f)
         # K_XX + k_XZ K_ZZ^{-1/2} (S - I) K_ZZ^{-1/2} k_ZX

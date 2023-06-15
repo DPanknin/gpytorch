@@ -8,7 +8,7 @@ from ..priors import Prior
 from .mean import Mean
 
 
-class ConstantMeanGradGrad(Mean):
+class ConstantMeanGradGrad(Mean): # TODO added by DANNY (only derivative case)
     r"""
     A (non-zero) constant prior mean function and its first and second derivatives, i.e.:
 
@@ -32,16 +32,25 @@ class ConstantMeanGradGrad(Mean):
         self,
         prior: Optional[Prior] = None,
         batch_shape: torch.Size = torch.Size(),
+        onlyDerivative=False,
         **kwargs: Any,
     ):
         super(ConstantMeanGradGrad, self).__init__()
         self.batch_shape = batch_shape
-        self.register_parameter(name="constant", parameter=torch.nn.Parameter(torch.zeros(*batch_shape, 1)))
-        if prior is not None:
-            self.register_prior("mean_prior", prior, "constant")
+        if onlyDerivative:
+            self.constant = torch.zeros(*batch_shape, 1)
+        else:
+            self.register_parameter(name="constant", parameter=torch.nn.Parameter(torch.zeros(*batch_shape, 1)))
+            if prior is not None:
+                self.register_prior("mean_prior", prior, "constant")
+        self.onlyDerivative = onlyDerivative
 
     def forward(self, input):
         batch_shape = torch.broadcast_shapes(self.batch_shape, input.shape[:-2])
-        mean = self.constant.unsqueeze(-1).expand(*batch_shape, input.size(-2), 2 * input.size(-1) + 1).contiguous()
-        mean[..., 1:] = 0
+        if self.onlyDerivative:
+            mean = self.constant.unsqueeze(-1).expand(*batch_shape, input.size(-2), 2 * input.size(-1)).contiguous()
+            mean[..., :] = 0
+        else:
+            mean = self.constant.unsqueeze(-1).expand(*batch_shape, input.size(-2), 2 * input.size(-1) + 1).contiguous()
+            mean[..., 1:] = 0
         return mean
