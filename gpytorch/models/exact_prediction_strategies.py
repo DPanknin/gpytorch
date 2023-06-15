@@ -16,6 +16,7 @@ from linear_operator.operators import (
     MatmulLinearOperator,
     RootLinearOperator,
     ZeroLinearOperator,
+    DiagLinearOperator, # TODO added by DANNY
 )
 from linear_operator.utils.cholesky import psd_safe_cholesky
 from linear_operator.utils.interpolation import left_interp, left_t_interp
@@ -28,17 +29,17 @@ from ..lazy import LazyEvaluatedKernelTensor
 from ..utils.memoize import add_to_cache, cached, clear_cache_hook, pop_from_cache
 
 
-def prediction_strategy(train_inputs, train_prior_dist, train_labels, likelihood):
+def prediction_strategy(train_inputs, train_prior_dist, train_labels, likelihood, jitter = None, cholJitter = None): # TODO added by DANNY (jitter)
     train_train_covar = train_prior_dist.lazy_covariance_matrix
     if isinstance(train_train_covar, LazyEvaluatedKernelTensor):
         cls = train_train_covar.kernel.prediction_strategy
     else:
         cls = DefaultPredictionStrategy
-    return cls(train_inputs, train_prior_dist, train_labels, likelihood)
+    return cls(train_inputs, train_prior_dist, train_labels, likelihood, jitter=jitter, cholJitter=cholJitter) # TODO added by DANNY (jitter)
 
 
 class DefaultPredictionStrategy(object):
-    def __init__(self, train_inputs, train_prior_dist, train_labels, likelihood, root=None, inv_root=None):
+    def __init__(self, train_inputs, train_prior_dist, train_labels, likelihood, root=None, inv_root=None, jitter = None, cholJitter = None): # TODO added by DANNY (jitter)
         # Get training shape
         self._train_shape = train_prior_dist.event_shape
 
@@ -62,6 +63,9 @@ class DefaultPredictionStrategy(object):
         self._last_test_train_covar = None
         mvn = self.likelihood(train_prior_dist, train_inputs)
         self.lik_train_train_covar = mvn.lazy_covariance_matrix
+        
+        self.jitter = jitter
+        self.cholJitter = cholJitter
 
         if root is not None:
             add_to_cache(self.lik_train_train_covar, "root_decomposition", RootLinearOperator(root))
@@ -253,7 +257,18 @@ class DefaultPredictionStrategy(object):
         train_mean, train_train_covar = mvn.loc, mvn.lazy_covariance_matrix
 
         train_labels_offset = (self.train_labels - train_mean).unsqueeze(-1)
-        mean_cache = train_train_covar.evaluate_kernel().solve(train_labels_offset).squeeze(-1)
+        
+        if False: # TODO changed by DANNY
+            mean_cache = train_train_covar.evaluate_kernel().solve(train_labels_offset).squeeze(-1)
+        # TODO the above mean_cache estimate is too bad
+        if True:
+            L = psd_safe_cholesky(to_dense(train_train_covar.evaluate_kernel()), jitter = self.cholJitter, max_tries=100) # TODO added by DANNY
+            mean_cache = torch.cholesky_solve(train_labels_offset, L).squeeze(-1)
+            #L = TriangularLazyTensor(L)
+            ## L @ L.T = K!
+            ##mean_cache = L.transpose(-2,-1).inv_matmul(L.inv_matmul(train_labels_offset)).squeeze(-1)
+            #mean_cache = L._cholesky_solve(train_labels_offset, upper=False).squeeze(-1)
+        
 
         if settings.detach_test_caches.on():
             mean_cache = mean_cache.detach()
@@ -273,7 +288,18 @@ class DefaultPredictionStrategy(object):
     def train_shape(self):
         return self._train_shape
 
-    def exact_prediction(self, joint_mean, joint_covar):
+    def exact_prediction(self, joint_mean, joint_covar, **kwargs): # TODO added by DANNY
+        
+        # try the following for reduced computational complexity, if we only require predictions
+        predictionsOnly = False
+        if 'predictionsOnly' in kwargs:
+            predictionsOnly = kwargs['predictionsOnly']
+        
+        if predictionsOnly:
+            predictive_mean = self.exact_predictive_mean(joint_mean, joint_covar.transpose(-2,-1)) 
+            fakeCovar = DiagLinearOperator(torch.ones_like(predictive_mean))
+            return (predictive_mean, fakeCovar)
+        
         # Find the components of the distribution that contain test data
         test_mean = joint_mean[..., self.num_train :]
         # For efficiency - we can make things more efficient
@@ -284,7 +310,7 @@ class DefaultPredictionStrategy(object):
         else:
             test_test_covar = joint_covar[..., self.num_train :, self.num_train :]
             test_train_covar = joint_covar[..., self.num_train :, : self.num_train]
-
+            
         return (
             self.exact_predictive_mean(test_mean, test_train_covar),
             self.exact_predictive_covar(test_test_covar, test_train_covar),
@@ -307,6 +333,7 @@ class DefaultPredictionStrategy(object):
             res = (test_train_covar @ self.mean_cache.squeeze(1).unsqueeze(-1)).squeeze(-1)
         else:
             res = (test_train_covar @ self.mean_cache.unsqueeze(-1)).squeeze(-1)
+            
         res = res + test_mean
 
         return res
@@ -745,7 +772,10 @@ class SGPRPredictionStrategy(DefaultPredictionStrategy):
 
         # Get terms needed for woodbury
         root = train_train_covar._linear_op.root_decomposition().root.to_dense()  # R
-        inv_diag = train_train_covar._diag_tensor.inverse()  # \sigma^{-2}
+        if False: # TODO changed by DANNY: There was some bug with accessing train_train_covar after evaluate_kernel()
+            inv_diag = train_train_covar._diag_tensor.inverse()  # \sigma^{-2}
+        if True:
+            inv_diag = self.lik_train_train_covar._diag_tensor.inverse()  # \sigma^{-2}
 
         # Form LT using woodbury
         ones = torch.tensor(1.0, dtype=root.dtype, device=root.device)
@@ -769,8 +799,18 @@ class SGPRPredictionStrategy(DefaultPredictionStrategy):
             "Fantasy observation updates not yet supported for models using SGPRPredictionStrategy"
         )
 
-    def exact_prediction(self, joint_mean, joint_covar):
+    def exact_prediction(self, joint_mean, joint_covar, **kwargs): # TODO added by DANNY
         from ..kernels.inducing_point_kernel import InducingPointKernel
+        
+        # try the following for reduced computational complexity, if we only require predictions
+        predictionsOnly = False
+        if 'predictionsOnly' in kwargs:
+            predictionsOnly = kwargs['predictionsOnly']
+        
+        if predictionsOnly:
+            predictive_mean = self.exact_predictive_mean(test_mean = joint_mean, test_train_covar = joint_covar.transpose(-2,-1)) 
+            fakeCovar = DiagLinearOperator(torch.ones_like(predictive_mean))
+            return (predictive_mean, fakeCovar)
 
         # Find the components of the distribution that contain test data
         test_mean = joint_mean[..., self.num_train :]

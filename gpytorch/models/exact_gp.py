@@ -6,6 +6,7 @@ from copy import deepcopy
 import torch
 
 from .. import settings
+from linear_operator.operators import DiagLinearOperator # TODO added by DANNY
 from ..distributions import MultitaskMultivariateNormal, MultivariateNormal
 from ..likelihoods import _GaussianLikelihoodBase
 from ..utils.generic import length_safe_zip
@@ -250,6 +251,18 @@ class ExactGP(GP):
         return new_model
 
     def __call__(self, *args, **kwargs):
+        
+        predictionsOnly = False # TODO added by DANNY
+        if 'predictionsOnly' in kwargs:
+            predictionsOnly = kwargs['predictionsOnly']
+            
+        jitter = None
+        if 'jitter' in kwargs:
+            jitter = kwargs['jitter']
+        cholJitter = None
+        if 'cholJitter' in kwargs:
+            cholJitter = kwargs['cholJitter']
+        
         train_inputs = list(self.train_inputs) if self.train_inputs is not None else []
         inputs = [i.unsqueeze(-1) if i.ndimension() == 1 else i for i in args]
 
@@ -296,7 +309,32 @@ class ExactGP(GP):
                     train_prior_dist=train_output,
                     train_labels=self.train_targets,
                     likelihood=self.likelihood,
-                )
+                    jitter=jitter,
+                    cholJitter=cholJitter,
+                ) # TODO modified by DANNY
+                
+            trainSize = train_inputs[0].shape[-2]
+            testSize, inputDim = inputs[0].shape
+            outputDim = self.covar_module.base_kernel.num_outputs_per_input(inputs[0], None)
+            # TODO modified by DANNY: in predictionsOnly-mode, if testSize exceeds a threshold (e.g. 1000), slice up xTest and call forward again on each slice. Then merge results
+            
+            memoryThreshold = int(2**25)
+            batchThresholdSize = int(max(1, memoryThreshold // (trainSize * outputDim**2)))
+            
+            if predictionsOnly and testSize > batchThresholdSize:
+                if outputDim > 1:
+                    predictive_mean = torch.empty(testSize,outputDim)
+                else:
+                    predictive_mean = torch.empty(testSize)
+                inx = 0
+                while inx < testSize:
+                    inxOld = inx
+                    inx += batchThresholdSize
+                    xBatch = inputs[0][inxOld:inx]
+                    batchPred = self.__call__(xBatch, **kwargs)
+                    predictive_mean[inxOld:inx] = batchPred.mean
+                fakeCovar = DiagLinearOperator(torch.ones(predictive_mean.numel()))
+                return batchPred.__class__(predictive_mean, fakeCovar)
 
             # Concatenate the input to the training input
             full_inputs = []
@@ -313,24 +351,32 @@ class ExactGP(GP):
                 full_inputs.append(torch.cat([train_input, input], dim=-2))
 
             # Get the joint distribution for training/test data
-            full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
+            if predictionsOnly: # TODO modified by DANNY
+                # only calculate test-mean and train-test covariance
+                full_output = super(ExactGP, self).__call__(*train_inputs, y = inputs[0], **kwargs)
+            else:
+                full_output = super(ExactGP, self).__call__(*full_inputs, **kwargs)
+            
             if settings.debug().on():
                 if not isinstance(full_output, MultivariateNormal):
                     raise RuntimeError("ExactGP.forward must return a MultivariateNormal")
             full_mean, full_covar = full_output.loc, full_output.lazy_covariance_matrix
-
+            
             # Determine the shape of the joint distribution
             batch_shape = full_output.batch_shape
             joint_shape = full_output.event_shape
             tasks_shape = joint_shape[1:]  # For multitask learning
-            test_shape = torch.Size([joint_shape[0] - self.prediction_strategy.train_shape[0], *tasks_shape])
+            if predictionsOnly: # TODO modified by DANNY
+                test_shape = torch.Size([joint_shape[0], *tasks_shape])
+            else:
+                test_shape = torch.Size([joint_shape[0] - self.prediction_strategy.train_shape[0], *tasks_shape])
 
             # Make the prediction
             with settings.cg_tolerance(settings.eval_cg_tolerance.value()):
                 (
                     predictive_mean,
                     predictive_covar,
-                ) = self.prediction_strategy.exact_prediction(full_mean, full_covar)
+                ) = self.prediction_strategy.exact_prediction(full_mean, full_covar, **kwargs) # TODO modified by DANNY
 
             # Reshape predictive mean to match the appropriate event shape
             predictive_mean = predictive_mean.view(*batch_shape, *test_shape).contiguous()
